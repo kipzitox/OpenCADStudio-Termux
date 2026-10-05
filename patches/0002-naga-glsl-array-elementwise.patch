@@ -1,0 +1,235 @@
+--- a/vendor/naga/src/back/glsl/writer.rs
++++ b/vendor/naga/src/back/glsl/writer.rs
+@@ -1,6 +1,5 @@
+ use super::*;
+ 
+-/// Writer responsible for all code generation.
+ pub struct Writer<'a, W> {
+     // Inputs
+     /// The module being written.
+@@ -563,6 +562,35 @@
+         }
+     }
+ 
++    /// Write a type in a *declaration* position (local variable, parameter,
++    /// return type, global).
++    fn write_type_decl(&mut self, ty: Handle<crate::Type>) -> BackendResult {
++        self.write_type(ty)
++    }
++
++    /// If `expr` is a `Compose` that builds an array, return its components.
++    ///
++    /// GLSL ES array constructors are rejected by the Mali driver behind ANGLE
++    /// on WebGL2 whenever their components are not literals: any other operand
++    /// fails with `S0032: no default precision defined for variable 'vec4[8]'`,
++    /// regardless of the precision qualifier on the array itself. Such
++    /// constructors must therefore be replaced by element-wise assignments
++    /// wherever we have a statement to emit them in.
++    fn array_compose_components<'ctx>(
++        &self,
++        expr: Handle<crate::Expression>,
++        ctx: &'ctx back::FunctionCtx,
++    ) -> Option<&'ctx Vec<Handle<crate::Expression>>> {
++        match ctx.expressions[expr] {
++            crate::Expression::Compose { ty, ref components }
++                if matches!(self.module.types[ty].inner, TypeInner::Array { .. }) =>
++            {
++                Some(components)
++            }
++            _ => None,
++        }
++    }
++
+     /// Helper method to write a image type
+     ///
+     /// # Notes
+@@ -755,7 +783,7 @@
+         handle: Handle<crate::GlobalVariable>,
+         global: &crate::GlobalVariable,
+     ) -> BackendResult {
+-        self.write_type(global.ty)?;
++        self.write_type_decl(global.ty)?;
+         write!(self.out, " ")?;
+         self.write_global_name(handle, global)?;
+ 
+@@ -823,7 +851,7 @@
+                 // of the interface block. Since the interface block is
+                 // anonymous, this becomes visible in the global scope.
+                 write!(self.out, "{{ ")?;
+-                self.write_type(global.ty)?;
++                self.write_type_decl(global.ty)?;
+                 write!(self.out, " ")?;
+                 self.write_global_name(handle, global)?;
+                 if let TypeInner::Array { base, size, .. } = self.module.types[global.ty].inner {
+@@ -1168,7 +1196,7 @@
+ 
+         // Write the type
+         // `write_type` adds no leading or trailing spaces
+-        self.write_type(ty)?;
++        self.write_type_decl(ty)?;
+ 
+         // Finally write the global name and end the global with a `;` and a newline
+         // Leading space is important
+@@ -1229,7 +1257,7 @@
+         if let back::FunctionType::EntryPoint(_) = ctx.ty {
+             write!(self.out, "void")?;
+         } else if let Some(ref result) = func.result {
+-            self.write_type(result.ty)?;
++            self.write_type_decl(result.ty)?;
+             if let TypeInner::Array { base, size, .. } = self.module.types[result.ty].inner {
+                 self.write_array_size(base, size)?
+             }
+@@ -1288,11 +1316,11 @@
+                 TypeInner::Pointer { base, .. } => {
+                     // write parameter qualifiers
+                     write!(this.out, "inout ")?;
+-                    this.write_type(base)?;
++                    this.write_type_decl(base)?;
+                 }
+                 // All other types are written by `write_type`
+                 _ => {
+-                    this.write_type(arg.ty)?;
++                    this.write_type_decl(arg.ty)?;
+                 }
+             }
+ 
+@@ -1330,13 +1358,13 @@
+             let stage = self.module.entry_points[ep_index as usize].stage;
+             for (index, arg) in func.arguments.iter().enumerate() {
+                 write!(self.out, "{}", back::INDENT)?;
+-                self.write_type(arg.ty)?;
++                self.write_type_decl(arg.ty)?;
+                 let name = &self.names[&NameKey::EntryPointArgument(ep_index, index as u32)];
+                 write!(self.out, " {name}")?;
+                 write!(self.out, " = ")?;
+                 match self.module.types[arg.ty].inner {
+                     TypeInner::Struct { ref members, .. } => {
+-                        self.write_type(arg.ty)?;
++                        self.write_type_decl(arg.ty)?;
+                         write!(self.out, "(")?;
+                         for (index, member) in members.iter().enumerate() {
+                             let varying_name = VaryingName {
+@@ -1371,7 +1399,7 @@
+             // Write indentation (only for readability) and the type
+             // `write_type` adds no trailing space
+             write!(self.out, "{}", back::INDENT)?;
+-            self.write_type(local.ty)?;
++            self.write_type_decl(local.ty)?;
+ 
+             // Write the local name
+             // The leading space is important
+@@ -1473,7 +1501,7 @@
+     fn write_global_constant(&mut self, handle: Handle<crate::Constant>) -> BackendResult {
+         write!(self.out, "const ")?;
+         let constant = &self.module.constants[handle];
+-        self.write_type(constant.ty)?;
++        self.write_type_decl(constant.ty)?;
+         let name = &self.names[&NameKey::Constant(handle)];
+         write!(self.out, " {name}")?;
+         if let TypeInner::Array { base, size, .. } = self.module.types[constant.ty].inner {
+@@ -1550,7 +1578,7 @@
+                     size,
+                     stride: _,
+                 } => {
+-                    self.write_type(base)?;
++                    self.write_type_decl(base)?;
+                     write!(
+                         self.out,
+                         " {}",
+@@ -1564,7 +1592,7 @@
+                 _ => {
+                     // Write the member type
+                     // Adds no trailing space
+-                    self.write_type(member.ty)?;
++                    self.write_type_decl(member.ty)?;
+ 
+                     // Write the member name and put a semicolon
+                     // The leading space is important
+@@ -1989,11 +2017,24 @@
+             }
+             // Stores in glsl are just variable assignments written as `pointer = value;`
+             Statement::Store { pointer, value } => {
+-                write!(self.out, "{level}")?;
+-                self.write_expr(pointer, ctx)?;
+-                write!(self.out, " = ")?;
+-                self.write_expr(value, ctx)?;
+-                writeln!(self.out, ";")?
++                // Array values are assigned element-wise: the GLSL ES array
++                // constructor is rejected by the Mali driver when its operands
++                // are not literals.
++                if let Some(components) = self.array_compose_components(value, ctx) {
++                    for (index, component) in components.iter().enumerate() {
++                        write!(self.out, "{level}")?;
++                        self.write_expr(pointer, ctx)?;
++                        write!(self.out, "[{index}] = ")?;
++                        self.write_expr(*component, ctx)?;
++                        writeln!(self.out, ";")?;
++                    }
++                } else {
++                    write!(self.out, "{level}")?;
++                    self.write_expr(pointer, ctx)?;
++                    write!(self.out, " = ")?;
++                    self.write_expr(value, ctx)?;
++                    writeln!(self.out, ";")?
++                }
+             }
+             Statement::WorkGroupUniformLoad { pointer, result } => {
+                 // GLSL doesn't have pointers, which means that this backend needs to ensure that
+@@ -2028,7 +2069,7 @@
+                 if let Some(expr) = result {
+                     let name = Baked(expr).to_string();
+                     let result = self.module.functions[function].result.as_ref().unwrap();
+-                    self.write_type(result.ty)?;
++                    self.write_type_decl(result.ty)?;
+                     write!(self.out, " {name}")?;
+                     if let TypeInner::Array { base, size, .. } = self.module.types[result.ty].inner
+                     {
+@@ -2066,7 +2107,7 @@
+                     } => {
+                         let result_handle = result.expect("CompareExchange must have a result");
+                         let res_name = Baked(result_handle).to_string();
+-                        self.write_type(ctx.info[result_handle].ty.handle().unwrap())?;
++                        self.write_type_decl(ctx.info[result_handle].ty.handle().unwrap())?;
+                         write!(self.out, " {res_name};")?;
+                         write!(self.out, " {res_name}.old_value = atomicCompSwap(")?;
+                         self.write_expr(pointer, ctx)?;
+@@ -2087,7 +2128,7 @@
+                     _ => {
+                         if let Some(result) = result {
+                             let res_name = Baked(result).to_string();
+-                            self.write_type(ctx.info[result].ty.handle().unwrap())?;
++                            self.write_type_decl(ctx.info[result].ty.handle().unwrap())?;
+                             write!(self.out, " {res_name} = ")?;
+                             self.named_expressions.insert(result, res_name);
+                         }
+@@ -4305,7 +4346,7 @@
+                     write!(self.out, "{ty_name}")?;
+                 }
+                 _ => {
+-                    self.write_type(ty_handle)?;
++                    self.write_type_decl(ty_handle)?;
+                 }
+             },
+             proc::TypeResolution::Value(ref inner) => {
+@@ -4319,6 +4360,21 @@
+         if let TypeInner::Array { base, size, .. } = *resolved {
+             self.write_array_size(base, size)?;
+         }
++
++        // Initialise arrays element-wise rather than with an array
++        // constructor, which the Mali driver behind ANGLE rejects unless all
++        // its operands are literals.
++        if let Some(components) = self.array_compose_components(handle, ctx) {
++            writeln!(self.out, ";")?;
++            for (index, component) in components.iter().enumerate() {
++                write!(self.out, "{name}[{index}] = ")?;
++                self.write_expr(*component, ctx)?;
++                writeln!(self.out, ";")?;
++            }
++            self.named_expressions.insert(named, name);
++            return Ok(());
++        }
++
+         write!(self.out, " = ")?;
+         self.write_expr(handle, ctx)?;
+         writeln!(self.out, ";")?;

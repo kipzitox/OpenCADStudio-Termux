@@ -1,0 +1,6 @@
+# Build output
+web-dist/
+target/
+
+# termux runtime scratch
+*.log

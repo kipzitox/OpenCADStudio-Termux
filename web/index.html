@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>OpenCADStudio</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0b1016;
+        overscroll-behavior: none;
+        touch-action: none;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+      #status {
+        position: fixed;
+        left: 0;
+        right: 0;
+        top: 0;
+        padding: 12px;
+        text-align: center;
+        color: #8fa3bf;
+        font: 14px system-ui, sans-serif;
+        background: #0b1016;
+        z-index: 10;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="ocs-canvas"></canvas>
+    <div id="status">Iniciando…</div>
+    <script type="module">
+      const started = performance.now();
+      const stamp = Date.now();
+      const status = document.getElementById("status");
+      const canvas = document.getElementById("ocs-canvas");
+      const seconds = () => ((performance.now() - started) / 1000).toFixed(1);
+      const say = (t) => { if (status) status.textContent = t; };
+
+      try {
+        say("Cargando modulo wasm… " + seconds() + "s");
+
+        // Cache-bust both the glue and the wasm so a rebuild is never masked by
+        // the browser cache.
+        const glue = await import("./ocs.js?v=" + stamp);
+        const init = glue.default;
+
+        say("Cargando OpenCADStudio… " + seconds() + "s");
+        const wasmUrl = new URL("./ocs_bg.wasm?v=" + stamp, import.meta.url);
+
+        const tick = setInterval(() => say("Cargando OpenCADStudio… " + seconds() + "s"), 500);
+        await init({ module_or_path: wasmUrl.toString(), canvas });
+        clearInterval(tick);
+
+        // iced appends its own drawing surface to the body. This placeholder is
+        // sized 100%/100%, so it would push iced's canvas below the fold and
+        // leave a blank screen. Drop ours as soon as iced has its own.
+        for (let i = 0; i < 60; i++) {
+          if (document.querySelectorAll("canvas").length > 1 && canvas.isConnected) {
+            canvas.remove();
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+
+        if (status) status.remove();
+        console.log("OpenCADStudio started in " + seconds() + "s");
+      } catch (error) {
+        console.error("OpenCADStudio failed to start: " + (error && error.message ? error.message : error));
+        say("Error: " + (error && error.message ? error.message : error));
+      }
+    </script>
+  </body>
+</html>

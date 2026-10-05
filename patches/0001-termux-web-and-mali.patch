@@ -1,0 +1,784 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 34a35a3b..8b0a5195 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -59,6 +59,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "sha2 0.10.9",
++ "smol",
+  "ttf-parser",
+  "unicode-bidi",
+  "ureq",
+@@ -3560,8 +3561,6 @@ dependencies = [
+ [[package]]
+ name = "naga"
+ version = "29.0.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
+ dependencies = [
+  "arrayvec",
+  "bit-set 0.9.1",
+diff --git a/Cargo.toml b/Cargo.toml
+index 8cae06e8..dee706c8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,7 +23,11 @@ calamine = "0.36.1"
+ base64 = "0.22"
+ semver = "1"
+ url = "2"
+-iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["image", "svg", "advanced", "canvas", "smol", "markdown"] }
++# `smol` is deliberately NOT a feature here. iced's `smol` feature pulls
++# async-io -> errno, which refuses to compile for wasm32 ("The target OS is
++# unknown or none"). Cargo unions features across target sections, so enabling
++# it here would break the web build. Native only gets it, below.
++iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["image", "svg", "advanced", "canvas", "markdown"] }
+ iced_runtime = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+ iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+ iced_aw = { git = "https://github.com/HakanSeven12/iced_aw.git", branch = "agent/fix-iced-fonts", features = ["menu", "context_menu", "color_picker", "drop_down"] }
+@@ -85,9 +89,24 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString"
+ [patch.crates-io]
+ iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+ iced_widget = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
++# The Mali driver behind ANGLE on WebGL2 rejects GLSL ES array constructors
++# unless every operand is a literal: `vec4[8](a, b, ...)` fails with
++# `S0032: no default precision defined for variable 'vec4[8]'`, and adding an
++# explicit `highp` to the array or to the operands does not help. That fatally
++# aborts iced_wgpu's `triangle.gradient` pipeline on web.
++#
++# vendor/naga is naga 29.0.4 unmodified except for the GLSL backend, which now
++# emits array initialisation element-wise (`a[0] = ...;`) in the statement
++# positions where a constructor used to be written. Keep this in sync when
++# bumping naga upstream.
++naga = { path = "vendor/naga" }
+ 
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ getrandom = "0.3"
++# Native runtime only. `smol` pulls async-io -> errno, which does not build for
++# wasm32. On web iced uses its wasm_bindgen backend, so nothing here is needed.
++smol = "2"
++iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["smol"] }
+ ocs_plugin_api = { path = "crates/ocs_plugin_api", features = ["host"] }
+ bincode = "1.3"
+ meshopt = "0.6.2"
+@@ -142,6 +161,7 @@ web-sys = { version = "=0.3.85", features = [
+     "HtmlCanvasElement",
+     "CanvasRenderingContext2d",
+     "ImageData",
++    "BlobPropertyBag",
+ ] }
+ iced = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39", features = ["webgl", "fira-sans"] }
+ 
+diff --git a/src/app/mod.rs b/src/app/mod.rs
+index 49737650..c14eb6cf 100644
+--- a/src/app/mod.rs
++++ b/src/app/mod.rs
+@@ -4612,14 +4612,15 @@ impl OpenCADStudio {
+         s.read_only = cfg.read_only;
+         // GPU backend / renderer fallback: the resolver ran before iced
+         // booted, so surface its verdict here where the user can see it.
++        // Only the in-app command line gets these: `gpu_backend::resolve`
++        // already wrote both notices to stderr while probing, so echoing them
++        // again here printed every line twice.
+         if let Some(notice) = cfg.gpu_fallback_notice {
+             s.command_line.push_warning(&notice);
+-            crate::scene::pipeline::report_gpu_line(&format!("[gpu] {notice}"));
+         }
+         if cfg.gpu_compat_auto {
+-            let notice = crate::gpu_backend::compat_notice();
+-            s.command_line.push_warning(&notice);
+-            crate::scene::pipeline::report_gpu_line(&format!("[gpu] {notice}"));
++            s.command_line
++                .push_warning(&crate::gpu_backend::compat_notice());
+         }
+         let cli_open: Task<Message> = if !cfg.files.is_empty() {
+             Task::batch(
+diff --git a/src/app/update/mod.rs b/src/app/update/mod.rs
+index f84c315a..4d99f5bb 100644
+--- a/src/app/update/mod.rs
++++ b/src/app/update/mod.rs
+@@ -3658,7 +3658,10 @@ impl OpenCADStudio {
+             // ── Cursor / viewport messages ─────────────────────────────────
+             Message::CursorMoved(p, viewport) => self.on_cursor_moved(p, viewport),
+ 
+-            Message::ViewportMove(p) => self.on_viewport_move(p),
++            Message::ViewportMove(p) => {
++                let moved = self.on_viewport_move(p);
++                Task::batch([moved, self.hover_dwell_debounce()])
++            }
+ 
+             Message::ViewportExit => self.on_viewport_exit(),
+ 
+@@ -3682,7 +3685,8 @@ impl OpenCADStudio {
+                     return Task::none();
+                 }
+                 self.focus_model_pane(idx);
+-                self.on_viewport_move(p)
++                let moved = self.on_viewport_move(p);
++                Task::batch([moved, self.hover_dwell_debounce()])
+             }
+             Message::PaneMoveStart => {
+                 let i = self.active_tab;
+diff --git a/src/app/update/viewport.rs b/src/app/update/viewport.rs
+index bb34d867..4c47c099 100644
+--- a/src/app/update/viewport.rs
++++ b/src/app/update/viewport.rs
+@@ -20,6 +20,11 @@ use crate::scene::{
+ use crate::ui::PropertiesPanel;
+ use codec::types::Color as AcadColor;
+ use codec::{EntityType as AcadEntityType, Handle};
++
++// Web-only: the hover dwell debounce uses the browser timer, because iced runs
++// on wasm_bindgen there and `smol` is not available (see Cargo.toml).
++#[cfg(target_arch = "wasm32")]
++use wasm_bindgen::prelude::*;
+ use iced::time::Instant;
+ use iced::{mouse, Point, Task};
+ use std::sync::Arc;
+@@ -5808,6 +5813,52 @@ properties={:.1}ms picked={}",
+         Task::none()
+     }
+ 
++    /// Arms the one-shot debounce that fires `HoverDwellTick` once the
++    /// cursor has been still for `HOVER_DWELL_MS`.
++    ///
++    /// Every `ViewportMove` arms a fresh timer, so a moving cursor never
++    /// reaches the deadline and never costs a frame; only the final pause
++    /// survives long enough to deliver the tick. This replaces a
++    /// `window::frames()` subscription that re-rendered the viewport at
++    /// refresh rate purely to discover the cursor was still moving.
++    pub(in crate::app) fn hover_dwell_debounce(&self) -> Task<Message> {
++        if self.hover_dwell.is_none() {
++            return Task::none();
++        }
++        let delay = std::time::Duration::from_millis(crate::app::HOVER_DWELL_MS as u64);
++
++        // Native uses the smol runtime iced is configured with; on web iced
++        // switches to wasm_bindgen and `smol` does not even build, so use the
++        // browser's own timer.
++        #[cfg(not(target_arch = "wasm32"))]
++        let wait = async move {
++            smol::Timer::after(delay).await;
++        };
++
++        #[cfg(target_arch = "wasm32")]
++        let wait = async move {
++            let schedule = |resolve: js_sys::Function| {
++                web_sys::window().and_then(|w| {
++                    w.set_timeout_with_callback_and_timeout_and_arguments_0(
++                        resolve.unchecked_ref(),
++                        delay.as_millis() as i32,
++                    )
++                    .ok()
++                })
++            };
++            let promise = js_sys::Promise::new(&mut |resolve, _| {
++                if schedule(resolve).is_none() {
++                    web_sys::console::error_1(
++                        &"OpenCADStudio: hover dwell timer unavailable".into(),
++                    );
++                }
++            });
++            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
++        };
++
++        Task::perform(wait, |_| Message::HoverDwellTick)
++    }
++
+     pub(super) fn on_hover_dwell_tick(&mut self) -> Task<Message> {
+         let Some(dwell) = self.hover_dwell.clone() else {
+             return Task::none();
+diff --git a/src/app/view/mod.rs b/src/app/view/mod.rs
+index ca050c29..2c6313ad 100644
+--- a/src/app/view/mod.rs
++++ b/src/app/view/mod.rs
+@@ -2531,14 +2531,17 @@ impl OpenCADStudio {
+         } else {
+             Subscription::none()
+         };
+-        // While a rollover pick is queued, drive ticks so it fires the
+-        // moment the cursor has been still for the dwell window — without
+-        // this `ViewportMove` alone never re-fires once the user stops.
+-        let hover_dwell = if self.hover_dwell.is_some() {
+-            window::frames().map(|_| Message::HoverDwellTick)
+-        } else {
+-            Subscription::none()
+-        };
++        // A rollover pick is queued while the cursor moves, but the pick
++        // itself must wait until the cursor has been still for the dwell
++        // window. Driving that from `window::frames()` is backwards: every
++        // tick re-renders the whole viewport only for the handler to bail
++        // out because the cursor is still moving, so the app renders
++        // continuously and never reaches idle. On a slow renderer that
++        // starves the event pump and the cursor itself starts to lag.
++        //
++        // `on_viewport_move` arms a one-shot debounce timer instead, so no
++        // frame is requested until the dwell deadline actually arrives.
++        let hover_dwell = Subscription::none();
+         // Interaction LOD: while the view is (or just was) navigating, keep
+         // requesting frames a little past the settle point. Panning itself is
+         // driven by input events, but once the cursor stops no event would fire
+diff --git a/src/scene/pipeline/hatch_gpu/mod.rs b/src/scene/pipeline/hatch_gpu/mod.rs
+index 39ece95f..79e13d36 100644
+--- a/src/scene/pipeline/hatch_gpu/mod.rs
++++ b/src/scene/pipeline/hatch_gpu/mod.rs
+@@ -118,7 +118,7 @@ impl HatchGpu {
+                 },
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: super::MSAA_SAMPLES,
++                count: super::msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+diff --git a/src/scene/pipeline/mod.rs b/src/scene/pipeline/mod.rs
+index 066bdc74..d06f884e 100644
+--- a/src/scene/pipeline/mod.rs
++++ b/src/scene/pipeline/mod.rs
+@@ -75,6 +75,45 @@ struct SilhouetteSourceGroup {
+ use device_capabilities::DeviceCapabilities;
+ 
+ /// MSAA sample count for the main drawing pipelines.
++///
++/// Defaults to 4x, which is what the pipelines are validated against, but drops
++/// to 1x when the app has already decided it is running on a software
++/// rasteriser (`cli::gui_config().compat_renderer`, set by gpu_backend.rs for
++/// llvmpipe/lavapipe/WARP/SwiftShader). MSAA multiplies fragment work by the
++/// sample count, and on a CPU rasteriser that is the single largest per-frame
++/// cost: at 2705x1531, 4x means 16.6M samples shaded per frame against 4.14M
++/// at 1x. The visual cost is jaggier edges, which is the right trade for a
++/// machine with no GPU.
++///
++/// `OCS_MSAA_SAMPLES` overrides both, for A/B measurement.
++fn msaa_samples() -> u32 {
++    // On the web there is no environment to read `OCS_MSAA_SAMPLES` from, and
++    // `crate::cli` is not compiled for wasm32. WebGL2 multisampling is handled
++    // by the driver with its own sample count, so use the default.
++    #[cfg(target_arch = "wasm32")]
++    {
++        return MSAA_SAMPLES;
++    }
++
++    #[cfg(not(target_arch = "wasm32"))]
++    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    #[cfg(not(target_arch = "wasm32"))]
++    *CACHE.get_or_init(|| {
++        if let Some(raw) = std::env::var_os("OCS_MSAA_SAMPLES") {
++            let raw = raw.to_string_lossy();
++            if let Ok(n) = raw.trim().parse::<u32>() {
++                if matches!(n, 1 | 2 | 4 | 8) {
++                    return n;
++                }
++            }
++        }
++        if crate::cli::gui_config().compat_renderer {
++            1
++        } else {
++            MSAA_SAMPLES
++        }
++    })
++}
+ const MSAA_SAMPLES: u32 = 4;
+ const SHADOW_MAP_SIZE: u32 = 2048;
+ 
+@@ -706,7 +745,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -746,7 +785,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -825,7 +864,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -867,7 +906,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -910,7 +949,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -966,7 +1005,7 @@ impl Pipeline {
+                     bias: wgpu::DepthBiasState::default(),
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1073,7 +1112,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1386,7 +1425,7 @@ impl Pipeline {
+                 },
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1433,7 +1472,7 @@ impl Pipeline {
+                     },
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1485,7 +1524,7 @@ impl Pipeline {
+                     },
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1532,7 +1571,7 @@ impl Pipeline {
+                     },
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1582,7 +1621,7 @@ impl Pipeline {
+                         bias: wgpu::DepthBiasState::default(),
+                     }),
+                     multisample: wgpu::MultisampleState {
+-                        count: MSAA_SAMPLES,
++                        count: msaa_samples(),
+                         mask: !0,
+                         alpha_to_coverage_enabled: false,
+                     },
+@@ -1659,7 +1698,7 @@ impl Pipeline {
+                     bias: wgpu::DepthBiasState::default(),
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1725,7 +1764,7 @@ impl Pipeline {
+                     bias: wgpu::DepthBiasState::default(),
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1781,7 +1820,7 @@ impl Pipeline {
+                 },
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1828,7 +1867,7 @@ impl Pipeline {
+                     },
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -1892,7 +1931,7 @@ impl Pipeline {
+                 },
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1939,7 +1978,7 @@ impl Pipeline {
+                 },
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1989,7 +2028,7 @@ impl Pipeline {
+                     },
+                 }),
+                 multisample: wgpu::MultisampleState {
+-                    count: MSAA_SAMPLES,
++                    count: msaa_samples(),
+                     mask: !0,
+                     alpha_to_coverage_enabled: false,
+                 },
+@@ -2091,7 +2130,7 @@ impl Pipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: MSAA_SAMPLES,
++                count: msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -2122,7 +2161,7 @@ impl Pipeline {
+                 &frame_bgl,
+                 &text_atlas_bgl,
+                 format,
+-                MSAA_SAMPLES,
++                msaa_samples(),
+                 &content_stencil,
+             );
+ 
+@@ -2130,7 +2169,7 @@ impl Pipeline {
+             device,
+             &frame_bgl,
+             format,
+-            MSAA_SAMPLES,
++            msaa_samples(),
+             &content_stencil,
+         );
+ 
+@@ -2138,7 +2177,7 @@ impl Pipeline {
+             device,
+             &frame_bgl,
+             format,
+-            MSAA_SAMPLES,
++            msaa_samples(),
+             &content_stencil,
+         );
+ 
+@@ -4013,6 +4052,15 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+         hidden_line: bool,
+         show_3d_edges: bool,
+     ) {
++        // With MSAA disabled every pass draws straight into the single-sample
++        // resolve texture: there is no multisampled source to resolve, and
++        // wgpu rejects a resolve_target whose attachment is not multisampled.
++        let single_sample = msaa_samples() == 1;
++        let color_target: &wgpu::TextureView = if single_sample {
++            &self.resolve_view
++        } else {
++            &self.msaa_view
++        };
+         let msaa = &self.msaa_view;
+         let [r, g, b, a] = bg_color;
+         let clear_color = if self.clip_boundary.is_some() || self.skip_background {
+@@ -4098,7 +4146,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("hatch.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4157,7 +4205,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("image.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4194,7 +4242,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("mesh.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4493,7 +4541,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                     label: Some("face3d.render_pass"),
+                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                        view: msaa,
++                        view: color_target,
+                         depth_slice: None,
+                         resolve_target: None,
+                         ops: wgpu::Operations {
+@@ -4564,7 +4612,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("face3d_edges.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4607,7 +4655,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("wire.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4758,7 +4806,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                     label: Some("text.render_pass"),
+                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                        view: msaa,
++                        view: color_target,
+                         depth_slice: None,
+                         resolve_target: None,
+                         ops: wgpu::Operations {
+@@ -4811,7 +4859,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("wipeout.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4861,7 +4909,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("selection_xray.render_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: msaa,
++                    view: color_target,
+                     depth_slice: None,
+                     resolve_target: None,
+                     ops: wgpu::Operations {
+@@ -4973,7 +5021,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+         // corner holds content; the rounded border stays the cleared bg color
+         // and is never sampled (the blit UV is scaled to render/alloc).
+         {
+-            let _resolve = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            let _resolve = (!single_sample).then(|| encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("msaa.resolve_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                     view: msaa,
+@@ -4988,7 +5036,7 @@ analytic={:.1} regular={:.1} blocks={:.1}",
+                 timestamp_writes: None,
+                 occlusion_query_set: None,
+                 multiview_mask: None,
+-            });
++            }));
+             // No draw calls — the pass itself triggers the MSAA resolve.
+         }
+         } // end `if !self.skip_geometry`
+@@ -5309,9 +5357,10 @@ impl Pipeline {
+     /// This slot's share. `alloc_size` is the real allocation, which is rounded
+     /// up from the requested size and grows only.
+     fn gpu_live_bytes(&self) -> GpuLiveBytes {
+-        // 4x MSAA colour (4 B/sample) + 4x MSAA depth-stencil (4 B/sample) +
++        // MSAA colour (4 B/sample) + MSAA depth-stencil (4 B/sample) +
+         // one single-sample resolve target.
+-        const BYTES_PER_PIXEL: u64 = (MSAA_SAMPLES as u64) * 4 + (MSAA_SAMPLES as u64) * 4 + 4;
++        let samples = msaa_samples() as u64;
++        let bytes_per_pixel: u64 = samples * 4 + samples * 4 + 4;
+         let pixels = u64::from(self.alloc_size.width) * u64::from(self.alloc_size.height);
+         GpuLiveBytes {
+             slots: 1,
+@@ -5321,7 +5370,7 @@ impl Pipeline {
+                 Some(_) => u64::from(SHADOW_MAP_SIZE) * u64::from(SHADOW_MAP_SIZE) * 4,
+                 None => 4,
+             },
+-            render_targets: pixels * BYTES_PER_PIXEL,
++            render_targets: pixels * bytes_per_pixel,
+             text_atlas: self
+                 .text_atlas_gpu
+                 .as_ref()
+@@ -5454,7 +5503,7 @@ fn create_depth_texture(device: &wgpu::Device, size: Size<u32>) -> wgpu::Texture
+             depth_or_array_layers: 1,
+         },
+         mip_level_count: 1,
+-        sample_count: MSAA_SAMPLES,
++        sample_count: msaa_samples(),
+         dimension: wgpu::TextureDimension::D2,
+         format: wgpu::TextureFormat::Depth24PlusStencil8,
+         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+@@ -5496,7 +5545,7 @@ fn create_msaa_texture(
+             depth_or_array_layers: 1,
+         },
+         mip_level_count: 1,
+-        sample_count: MSAA_SAMPLES,
++        sample_count: msaa_samples(),
+         dimension: wgpu::TextureDimension::D2,
+         format,
+         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+diff --git a/src/scene/pipeline/viewcube.rs b/src/scene/pipeline/viewcube.rs
+index 0b72f0e8..24803217 100644
+--- a/src/scene/pipeline/viewcube.rs
++++ b/src/scene/pipeline/viewcube.rs
+@@ -24,7 +24,6 @@ use viewcube_text_atlas::{
+     CARDINAL_TILE_START, FACE_TILE_COUNT, TILE_COUNT,
+ };
+ 
+-const VIEWCUBE_MSAA_SAMPLES: u32 = 4;
+ 
+ // ── ViewCube layout ───────────────────────────────────────────────────────
+ pub const VIEWCUBE_PX: u32 = 84; // 30% smaller cube (was 120)
+@@ -475,7 +474,7 @@ impl ViewCubeText {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: VIEWCUBE_MSAA_SAMPLES,
++                count: super::msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1222,7 +1221,7 @@ impl ViewCubePipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: VIEWCUBE_MSAA_SAMPLES,
++                count: super::msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1261,7 +1260,7 @@ impl ViewCubePipeline {
+                 bias: wgpu::DepthBiasState::default(),
+             }),
+             multisample: wgpu::MultisampleState {
+-                count: VIEWCUBE_MSAA_SAMPLES,
++                count: super::msaa_samples(),
+                 mask: !0,
+                 alpha_to_coverage_enabled: false,
+             },
+@@ -1551,10 +1550,16 @@ impl ViewCubePipeline {
+     ) {
+         let render_width = self.depth_texture_size.width.max(1);
+         let render_height = self.depth_texture_size.height.max(1);
++        let single_sample = super::msaa_samples() == 1;
++        let color_target: &wgpu::TextureView = if single_sample {
++            &self.resolve_view
++        } else {
++            &self.msaa_view
++        };
+         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+             label: Some("vc.pass"),
+             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                view: &self.msaa_view,
++                view: color_target,
+                 depth_slice: None,
+                 resolve_target: None,
+                 ops: wgpu::Operations {
+@@ -1601,9 +1606,12 @@ impl ViewCubePipeline {
+             width: render_width,
+             height: render_height,
+         };
++        // With MSAA off there is no multisampled source, so draw straight into
++        // the single-sample texture and skip the resolve pass entirely (wgpu
++        // rejects a 1-sample resolve target).
+         self.text
+-            .render(encoder, &self.msaa_view, &self.depth_view, local_clip);
+-        {
++            .render(encoder, color_target, &self.depth_view, local_clip);
++        if !single_sample {
+             let _resolve = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("vc.resolve_pass"),
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+@@ -1668,7 +1676,7 @@ fn create_depth_texture(device: &wgpu::Device, size: Size<u32>) -> wgpu::Texture
+             depth_or_array_layers: 1,
+         },
+         mip_level_count: 1,
+-        sample_count: VIEWCUBE_MSAA_SAMPLES,
++        sample_count: super::msaa_samples(),
+         dimension: wgpu::TextureDimension::D2,
+         format: wgpu::TextureFormat::Depth24PlusStencil8,
+         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+@@ -1689,7 +1697,7 @@ fn create_msaa_texture(
+             depth_or_array_layers: 1,
+         },
+         mip_level_count: 1,
+-        sample_count: VIEWCUBE_MSAA_SAMPLES,
++        sample_count: super::msaa_samples(),
+         dimension: wgpu::TextureDimension::D2,
+         format,
+         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+diff --git a/src/sys.rs b/src/sys.rs
+index 8fc8a05e..ca085c9d 100644
+--- a/src/sys.rs
++++ b/src/sys.rs
+@@ -358,7 +358,13 @@ pub fn download_bytes(name: &str, bytes: &[u8]) {
+     let array = js_sys::Uint8Array::from(bytes);
+     let parts = js_sys::Array::new();
+     parts.push(&array.buffer());
+-    let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence(&parts) else {
++    // The browser must know the payload's type, otherwise it sniffs it as
++    // plain text and Chrome replaces the suggested extension with `.txt`.
++    let options = web_sys::BlobPropertyBag::new();
++    options.set_type(mime_for_download(name));
++    let Ok(blob) =
++        web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options)
++    else {
+         return;
+     };
+     let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+@@ -373,6 +379,29 @@ pub fn download_bytes(name: &str, bytes: &[u8]) {
+     let _ = web_sys::Url::revoke_object_url(&url);
+ }
+ 
++/// Best-effort MIME type for a downloaded file, derived from its extension.
++/// `application/octet-stream` is the safe fallback when nothing matches.
++#[cfg(target_arch = "wasm32")]
++fn mime_for_download(name: &str) -> &'static str {
++    let lower = name.to_ascii_lowercase();
++    let ext = lower.rsplit('.').next().unwrap_or("");
++    match ext {
++        "dwg" => "application/acad",
++        "dxf" => "application/dxf",
++        "pdf" => "application/pdf",
++        "stl" => "model/stl",
++        "step" | "stp" => "application/step",
++        "obj" => "model/obj",
++        "zip" => "application/zip",
++        "png" => "image/png",
++        "svg" => "image/svg+xml",
++        "csv" => "text/csv",
++        "txt" | "log" => "text/plain",
++        "json" => "application/json",
++        _ => "application/octet-stream",
++    }
++}
++
+ /// Short platform string for bug reports: OS + architecture on the desktop,
+ /// the browser user-agent on the web.
+ #[cfg(not(target_arch = "wasm32"))]

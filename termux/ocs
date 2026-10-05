@@ -1,0 +1,40 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Open CAD Studio - interactive GUI editor on Termux.
+#
+# Runs the glibc build inside proot-distro and draws into Termux:X11.
+#
+#   ocs                       # empty drawing
+#   ocs plan.dxf              # open a drawing
+#   ocs plan.dwg plan2.dxf    # several tabs
+#   ocs --new                 # force a fresh drawing
+#   ocs plan.dxf --http 8090  # also host the REST automation API on the
+#                             # live window (needs a FILE argument: with
+#                             # --new/--http and no file the app deliberately
+#                             # runs headless and no window appears)
+#
+# Environment:
+#   OCS_DISPLAY_NUM  X display number, default 0
+#   OCS_BACKEND      wgpu backend, default vulkan (see lib helper)
+#   OCS_DISTRO       proot container, default debian
+
+. "${PREFIX:-/data/data/com.termux/files/usr}/lib/ocs-termux.sh"
+
+ocs_ensure_x11
+ocs_ensure_wm
+
+# Performance sysvars (see $PREFIX/lib/ocs-perf.scr). COMMANDLINEFADETIME 0
+# drops a 3-second window::frames() loop that ran after every command;
+# SELECTIONPREVIEW 0 stops hover bumping selection_generation, which is what
+# invalidates the scene-render cache; the rest drop per-pixel passes.
+if [ -f "$PREFIX/lib/ocs-perf.scr" ]; then
+    ocs_watch_resize
+    exec proot-distro login "${OCS_DISTRO:-debian}" --shared-x11 \
+        -e "DISPLAY=:${OCS_DISPLAY_NUM:-0}" -- \
+        env "LP_NUM_THREADS=${OCS_LP_THREADS:-4}" OCS_HATCH_LOD=1 \
+        /usr/local/bin/ocs "$@" --script "$PREFIX/lib/ocs-perf.scr"
+fi
+
+# Must precede ocs_run: ocs_run execs, so anything written after it never runs.
+ocs_watch_resize
+
+ocs_run "$@"

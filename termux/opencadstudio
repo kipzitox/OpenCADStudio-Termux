@@ -1,0 +1,156 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# OpenCADStudio launcher.
+#
+# Picks between the two ways of running the editor on Termux:
+#   web     the wasm build served to Chrome (hardware GPU via ANGLE)
+#   native  the glibc build inside proot-distro, drawn into Termux:X11 (llvmpipe)
+#
+# Both paths reuse the existing launchers: $PREFIX/bin/ocs for native, and a
+# plain static file server for web. Extra arguments are forwarded to the native
+# binary only (the web app takes its input from the browser's file picker).
+
+set -u
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+OCS_DISTRO="${OCS_DISTRO:-debian}"
+# Derived from $PREFIX and $OCS_DISTRO rather than spelled out, so this works
+# with any Termux prefix and any proot-distro container name.
+WEB_DIST="$PREFIX/var/lib/proot-distro/containers/$OCS_DISTRO/rootfs/root/OpenCADStudio/web-dist"
+WEB_PORT=8097
+LOG="$PREFIX/tmp/opencadstudio-web.log"
+
+usage() {
+	cat <<-EOF
+		OpenCADStudio
+
+		  opencadstudio            menú interactivo
+		  opencadstudio web        abrir en el navegador (GPU por ANGLE)
+		  opencadstudio native     ventana en Termux:X11 (proot + llvmpipe)
+		  opencadstudio native f.dxf  abrir un archivo concreto
+		  opencadstudio close      cerrar la ventana nativa
+		  opencadstudio stop       detener el servidor web
+
+	EOF
+}
+
+# Ask the native window to close itself (WM_DELETE_WINDOW) so the app gets to
+# save state and release the GPU, instead of being killed mid-frame. Falls back
+# to signalling the process when there is no window (headless `--script` runs).
+close_native() {
+	local closed=0 pid
+
+	# Graceful path: ask the X window manager to delete the window.
+	if [ -n "${DISPLAY:-}" ] && command -v xdotool >/dev/null 2>&1; then
+		local wins
+		wins="$(xdotool search --class OpenCADStudio 2>/dev/null)"
+		for w in $wins; do
+			if xdotool windowclose "$w" 2>/dev/null; then
+				echo "Cerrando ventana $w…"
+				closed=1
+			fi
+		done
+	fi
+
+	# Hard path: the proot-hosted editor process. Matched on the container path
+	# of the binary, which this script's own command line never contains, so
+	# pgrep cannot select the caller itself.
+	pids="$(pgrep -f 'target/release/OpenCADStudio' 2>/dev/null)"
+	for pid in $pids; do
+		[ "$pid" = "$$" ] && continue
+		kill "$pid" 2>/dev/null && {
+			echo "Cerrando proceso $pid…"
+			closed=1
+		}
+	done
+
+	if [ "$closed" -eq 0 ]; then
+		echo "No hay ninguna ventana de OpenCADStudio abierta."
+	else
+		# Wait for the GPU to be released before anything tries to grab it.
+		sleep 1
+		echo "OpenCADStudio cerrado."
+	fi
+}
+
+# Is something already answering on the web port?
+web_up() {
+	curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/" 2>/dev/null |
+		grep -q '^200$'
+}
+
+start_web() {
+	if web_up; then
+		echo "Servidor web ya activo en http://localhost:$WEB_PORT"
+	else
+		if [ ! -f "$WEB_DIST/index.html" ]; then
+			echo "Error: no existe $WEB_DIST/index.html" >&2
+			echo "Falta generar el build web (cargo build --release --target wasm32-unknown-unknown)." >&2
+			return 1
+		fi
+		mkdir -p "$(dirname "$LOG")"
+		# Serve from web-dist so index.html, the wasm, worker_pkg/ and fonts/
+		# all resolve at the paths the app requests.
+		cd "$WEB_DIST" || return 1
+		setsid nohup python3 -m http.server "$WEB_PORT" --bind 127.0.0.1 \
+			>"$LOG" 2>&1 </dev/null &
+		# Wait for it rather than opening a URL that would 404.
+		local i
+		for i in $(seq 1 40); do
+			web_up && break
+			sleep 0.25
+		done
+		if ! web_up; then
+			echo "Error: el servidor no arrancó; revisa $LOG" >&2
+			return 1
+		fi
+		echo "Servidor web iniciado en http://localhost:$WEB_PORT"
+	fi
+	# Cache-bust so a rebuild is never masked by the browser cache.
+	termux-open-url "http://localhost:$WEB_PORT/?v=$(date +%s)"
+}
+
+run_native() {
+	if [ ! -x "$PREFIX/bin/ocs" ]; then
+		echo "Error: falta $PREFIX/bin/ocs" >&2
+		return 1
+	fi
+	exec "$PREFIX/bin/ocs" "$@"
+}
+
+menu() {
+	echo
+	echo "  OpenCADStudio"
+	echo
+	echo "  1) Web      — en Chrome, GPU real (Mali/ANGLE)"
+	echo "  2) Nativo   — ventana en Termux:X11 (proot + llvmpipe)"
+	echo "  3) Cerrar   — cerrar la ventana nativa"
+	echo "  4) Salir"
+	echo
+	printf 'Elige [1-4]: '
+	local choice
+	read -r choice
+	case "$choice" in
+		1) start_web ;;
+		2) run_native ;;
+		3) close_native ;;
+		4 | "") return 0 ;;
+		*) echo "Opción no reconocida." >&2 ;;
+	esac
+}
+
+case "${1:-}" in
+	web) shift; start_web ;;
+	native) shift; run_native "$@" ;;
+	close | kill) shift; close_native ;;
+	stop)
+		pkill -f "http.server $WEB_PORT" 2>/dev/null &&
+			echo "Servidor web detenido." ||
+			echo "No hay servidor web en el puerto $WEB_PORT."
+		;;
+	-h | --help | help) usage ;;
+	"") menu ;;
+	*)
+		# Unknown subcommand: treat as a drawing for the native build.
+		run_native "$@"
+		;;
+esac
