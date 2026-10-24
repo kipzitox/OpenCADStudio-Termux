@@ -1,0 +1,45 @@
+OpenCADStudio-Termux patch 0003 -- save TEXT oblique angles in degrees.
+
+This patch is different from 0001 and 0002: it does not touch the OpenCADStudio
+checkout. It patches `opencadcodec`, which Cargo pulls as a git dependency into
+its own checkout under $CARGO_HOME/git/checkouts/, so apply-patches.sh applies it
+there after `cargo fetch` has downloaded the crate.
+
+The bug
+-------
+DXF group 51 (TEXT oblique angle) is defined in degrees, but the entity stores
+radians. The writer wrote the raw radian value, so a 15 degree slant was saved as
+0.26. Reopening and saving again read that 0.26 as degrees and wrote 0.0046, so
+the slant decayed toward zero on every save, silently and without any error.
+
+Every other oblique write in the same file already converts with to_degrees():
+STYLE group 50, ATTDEF group 51, ATTRIB group 51 and SHAPE group 51. TEXT was the
+only one that did not.
+
+Group 50 (STYLE) has its own regression test
+(`text_style_oblique_angle_is_degrees_on_the_wire`). Group 51 had no test, which
+is why this slipped through.
+
+Verified: a drawing with 15 degrees of oblique comes back as 15 degrees after
+three DXF save/reload cycles; the full opencadcodec test suite (58 suites) passes
+with the change.
+
+Upstream: HakanSeven12/opencadcodec, pinned at rev 42b44d2.
+
+diff --git a/src/io/dxf/writer/section_writer.rs b/src/io/dxf/writer/section_writer.rs
+index 259301a..a40be67 100644
+--- a/src/io/dxf/writer/section_writer.rs
++++ b/src/io/dxf/writer/section_writer.rs
+@@ -3868,7 +3868,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
+             self.writer.write_double(41, text.width_factor)?;
+         }
+         if text.oblique_angle != 0.0 {
+-            self.writer.write_double(51, text.oblique_angle)?;
++            // Group 51 is degrees; the entity stores radians, exactly like
++            // STYLE's group 50. Written raw, every DXF save shrinks the
++            // angle toward zero: 15 deg becomes 0.26, then 0.0046.
++            self.writer
++                .write_double(51, text.oblique_angle.to_degrees())?;
+         }
+         self.writer.write_string(7, &text.style)?;
+         if text.generation_flags != 0 {

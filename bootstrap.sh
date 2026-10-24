@@ -12,8 +12,8 @@
 # Options:
 #     --web-only      build only the web edition (GPU; the one most people want)
 #     --native-only   build only the native edition (CPU; needs Termux:X11)
-#     --skip-build    prepare everything but do not compile (useful for testing
-#                     the setup, or if you want to compile later by hand)
+#     --skip-build    prepare everything but do not compile; still downloads
+#                     Cargo dependencies (the patches need them)
 #     --prefix DIR    container name, default: debian
 #     -h, --help      this text
 #
@@ -21,7 +21,7 @@
 #   1. preflight        Termux from F-Droid, free disk space, required packages
 #   2. container        proot-distro container with a new enough Rust
 #   3. source           upstream checkout, pinned to the tag the patches match
-#   4. patches          0001 + 0002, which the builds need to work at all
+#   4. patches          0001-0003, which the builds need to work at all
 #   5. web build        wasm, served to Chrome -- this is the GPU path
 #   6. native build     glibc binary, software rendered into Termux:X11
 #   7. launchers        `opencadstudio` into $PREFIX/bin
@@ -172,21 +172,27 @@ fi
 # beats a marker flag, because it stays correct when someone applied the patches
 # by hand (or a previous bootstrap run died before writing any marker).
 patches_applied() {
-	in_container "cd '$TREE_IN_CONTAINER' && git apply --reverse --check '$HERE/patches/0001-termux-web-and-mali.patch' >/dev/null 2>&1"
+	in_container "cd '$TREE_IN_CONTAINER' && git apply --reverse --check '$HERE/patches/0001-termux-web-and-mali.patch' >/dev/null 2>&1" || return 1
+	# 0003 lives in the Cargo checkout of opencadcodec, not in this tree. That
+	# checkout only exists after `cargo fetch`, so "not fetched yet" counts as
+	# "not applied" and the patch step below fetches before applying it.
+	codec=$(in_container "ls -d \${CARGO_HOME:-\$HOME/.cargo}/git/checkouts/opencadcodec-*/42b44d2 2>/dev/null | head -n1")
+	[ -n "$codec" ] || return 1
+	in_container "cd '$codec' && git apply --reverse --check '$HERE/patches/0003-dxf-text-oblique-degrees.patch' >/dev/null 2>&1"
 }
 
 say "4/7  Parches de compatibilidad"
 if patches_applied; then
 	skip "parches ya aplicados"
 else
-	note "sin estos, el canvas sale en blanco y los .dxf se guardan como .txt"
-	# cargo fetch first: apply-patches.sh vendors naga from the registry cache,
-	# and an empty cache makes it stop with a message about cargo fetch.
-	if [ "$BUILD" = 1 ]; then
-		note "descargando dependencias de Cargo (una sola vez, varios cientos de MB)"
-		in_container "cd '$TREE_IN_CONTAINER' && (cargo fetch --locked 2>/dev/null || cargo fetch)" \
-			|| warn "cargo fetch devolvió error; si el paso de parches lo pide, reintenta"
-	fi
+	note "sin estos, el canvas sale en blanco, los .dxf se guardan como .txt y el texto oblicuo se degrada"
+	# cargo fetch first: the patch step vendors naga from the registry cache and
+	# patches opencadcodec in its git checkout, and both only exist once Cargo
+	# has fetched. This runs even with --skip-build for that reason: fetching is
+	# preparing, not compiling.
+	note "descargando dependencias de Cargo (una sola vez, varios cientos de MB)"
+	in_container "cd '$TREE_IN_CONTAINER' && (cargo fetch --locked 2>/dev/null || cargo fetch)" \
+		|| warn "cargo fetch devolvió error; si el paso de parches lo pide, reintenta"
 	in_container "cd '$TREE_IN_CONTAINER' && sh '$HERE/patches/apply-patches.sh' ." \
 		|| die "falló la aplicación de los parches
 

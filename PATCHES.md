@@ -1,11 +1,9 @@
 # Patches
 
-Two patches, in order. `patches/apply-patches.sh` applies both and vendors
-naga 29.0.4 for the second one to land on.
-
-They are not upstream commits. They are the changes this guide needs on top of
-`v2026.39` (`c623a016`) to run on Android under Termux + proot. Nothing here is
-pushed upstream.
+Three patches, in order. `patches/apply-patches.sh` applies all three: 0001 and 0002
+patch the OpenCADStudio tree (with 0001 adding `[patch.crates-io]` for naga and
+0002 vendoring naga 29.0.4), and 0003 patches `opencadcodec` in the Cargo git
+checkout after `cargo fetch`. Nothing here is pushed upstream.
 
 > **They are pinned to `v2026.39`.** They are diffs against that exact commit, so
 > `git apply` against a newer upstream release will either fail with a hunk
@@ -22,6 +20,7 @@ pushed upstream.
 |---|---|---|---|
 | 1 | `0001-termux-web-and-mali.patch` | 10 | Web build correctness + the Mali shader fix's Cargo side + performance work |
 | 2 | `0002-naga-glsl-array-elementwise.patch` | 1 | The GLSL backend rewrite that makes Mali/ANGLE render at all |
+| 3 | `0003-dxf-text-oblique-degrees.patch` | 1 (`opencadcodec`) | DXF TEXT oblique angle written in degrees (prevents decay on every save) |
 
 Apply with:
 
@@ -29,7 +28,9 @@ Apply with:
 sh patches/apply-patches.sh /path/to/OpenCADStudio
 ```
 
-Both are plain `git diff` output, so `git apply` is all that is involved.
+They are plain `git diff` output, so `git apply` is all that is involved. 0003 is
+applied to the cached `opencadcodec` checkout and forces a rebuild of that
+dependency because Cargo does not recompile it when files are edited in place.
 
 ## 0001 — termux web and Mali
 
@@ -44,20 +45,25 @@ Both are plain `git diff` output, so `git apply` is all that is involved.
 | `src/app/view/mod.rs`, `src/scene/pipeline/{mod,viewcube,hatch_gpu/mod}.rs` | Perf: MSAA count now comes from `msaa_samples()`, which drops to 1x on software rasterisers instead of always allocating a 4x buffer. |
 | `src/scene/pipeline/viewcube.rs` | Same: picks the single-sample resolve target when MSAA is 1x. |
 
-## 0002 — naga GLSL array element-wise
+## 0003 — DXF TEXT oblique angle in degrees
 
-This is the one that matters most, and it is a driver bug, not a style choice.
+`opencadcodec/src/io/dxf/writer/section_writer.rs` writes DXF group 51 (TEXT
+oblique angle) in radians even though DXF defines it as degrees. The reader
+converts group 51 from degrees to radians on load, so writing it raw means a
+15° slant comes out as 0.26°. Each subsequent save treats that 0.26 as degrees
+and writes 0.0046, so the angle decays toward zero with every save/reload
+cycle — silently.
 
-`vendor/naga/src/back/glsl/writer.rs` emitted GLSL ES array constructors for
-composed arrays:
+STYLE group 50 already converts with `to_degrees()` (and has a regression
+test). ATTDEF, ATTRIB and SHAPE already do too. TEXT is the only one that was
+missing it. This patch adds the conversion plus a short comment.
 
-```glsl
-vec2[N](a, b)      // rejected by the Mali/ANGLE GLSL ES compiler
-```
-
-The GLSL ES compiler in ANGLE's Vulkan backend on Mali GPUs accepts the
-constructor syntax only when every operand is a literal. With anything computed
-it fails to compile, so shaders die on device with no useful error — a blank
+Because this lives in `opencadcodec` (a git dependency) rather than in the
+OpenCADStudio tree, `apply-patches.sh` applies it to
+`$CARGO_HOME/git/checkouts/opencadcodec-*/42b44d2` and runs `cargo clean -p
+opencadcodec` for both native and wasm release targets so Cargo rebuilds it
+(despite the rev never changing). If `cargo fetch` has not been run yet, the
+script stops with instructions to fetch first.
 canvas. Declaring the operands `highp` does not help; only the emission form
 changes matter.
 

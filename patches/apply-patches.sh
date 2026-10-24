@@ -9,6 +9,10 @@
 # inside vendor/naga, so the tree has to exist and 0001 has to have landed
 # first. This script vendors naga 29.0.4 from the Cargo registry cache between
 # the two, which is why 0002 is a single-file diff rather than a whole-tree one.
+#
+# 0003 touches neither this tree nor naga: it patches `opencadcodec`, a git
+# dependency Cargo keeps in its own checkout under $CARGO_HOME. Run `cargo
+# fetch` before this script so that checkout exists, or 0003 has nowhere to go.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -65,7 +69,39 @@ else
 	echo "    ok"
 fi
 
+# 0003 is the odd one out: it does not patch this tree. It patches
+# `opencadcodec`, which Cargo keeps in its own checkout under $CARGO_HOME. That
+# checkout only exists after `cargo fetch`, which bootstrap.sh runs just before
+# calling this script; running this by hand on a bare tree will stop here and
+# ask for it.
+P3="$here/0003-dxf-text-oblique-degrees.patch"
+CODEC_REV=42b44d2
+codec=$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/opencadcodec-*/"$CODEC_REV" 2>/dev/null | head -n1 || true)
+
+echo "==> 0003-dxf-text-oblique-degrees"
+if [ -z "$codec" ]; then
+	echo "    opencadcodec $CODEC_REV no está descargado todavía." >&2
+	echo "    Ejecuta 'cargo fetch' en este árbol y vuelve a lanzar este script." >&2
+	exit 1
+fi
+
+if git -C "$codec" apply --reverse --check "$P3" >/dev/null 2>&1; then
+	echo "    ya aplicado, nada que hacer"
+else
+	git -C "$codec" apply --check "$P3"
+	git -C "$codec" apply "$P3"
+	echo "    ok"
+	# Cargo fingerprints a git dependency by its rev, not by the files inside the
+	# checkout, so editing that checkout in place is invisible to Cargo and it
+	# would happily reuse the old, unfixed object files. Drop them for both
+	# targets or the build keeps the bug.
+	if command -v cargo >/dev/null 2>&1; then
+		cargo clean -p opencadcodec --release >/dev/null 2>&1 || true
+		cargo clean -p opencadcodec --release --target wasm32-unknown-unknown >/dev/null 2>&1 || true
+	fi
+fi
+
 echo
-echo "Both patches applied. Next, depending on what you want to run:"
+echo "All three patches applied. Next, depending on what you want to run:"
 echo "  native:  cargo build --release --bin OpenCADStudio"
 echo "  web:     scripts/build-web.sh from this repo"
